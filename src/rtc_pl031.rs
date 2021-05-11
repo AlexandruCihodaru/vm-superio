@@ -110,10 +110,10 @@ impl<EV: RTCEvents> RTCEvents for Arc<EV> {
 /// ```
 pub struct RTC<EV: RTCEvents> {
     // The load register.
-    lr: u32,
+    pub lr: u32,
 
     // The offset applied to the counter to get the RTC value.
-    offset: i64,
+    pub offset: i64,
 
     // The MR register is used for implementing the RTC alarm. A
     // real time clock alarm is a feature that can be used to allow
