@@ -10,10 +10,13 @@
 //!
 //! This is done by emulating an UART serial port.
 
+use std::os::unix::prelude::RawFd;
+use std::os::unix::prelude::AsRawFd;
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::result::Result;
 use std::sync::Arc;
+use vmm_sys_util::eventfd::EventFd;
 
 use crate::Trigger;
 
@@ -144,6 +147,12 @@ impl<EV: SerialEvents> SerialEvents for Arc<EV> {
     }
 }
 
+// Cannot use multiple types as bounds for a trait object, so we define our own trait
+// which is a composition of the desired bounds. In this case, io::Read and AsRawFd.
+// Run `rustc --explain E0225` for more details.
+/// Trait that composes the `std::io::Read` and `std::os::unix::io::AsRawFd` traits.
+pub trait ReadableFd: io::Read + AsRawFd {}
+
 /// The serial console emulation is done by emulating a serial COM port.
 ///
 /// Each serial COM port (COM1-4) has an associated Port I/O address base and
@@ -224,6 +233,10 @@ pub struct Serial<T: Trigger, EV: SerialEvents, W: Write> {
     interrupt_evt: T,
     events: EV,
     out: W,
+    /// doc
+    pub input: Option<Box<dyn ReadableFd + Send>>,
+    /// doc
+    pub buffer_ready_evt: Option<EventFd>,
 }
 
 /// Errors encountered while handling serial console operations.
@@ -254,8 +267,8 @@ impl<T: Trigger, W: Write> Serial<T, NoEvents, W> {
     ///
     /// You can see an example of how to use this function in the
     /// [`Example` section from `Serial`](struct.Serial.html#example).
-    pub fn new(trigger: T, out: W) -> Serial<T, NoEvents, W> {
-        Self::with_events(trigger, NoEvents, out)
+    pub fn new(trigger: T, out: W, input: Option<Box<dyn ReadableFd + Send>>, kick: Option<EventFd>) -> Serial<T, NoEvents, W> {
+        Self::with_events(trigger, NoEvents, out, input, kick)
     }
 }
 
@@ -274,7 +287,7 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
     ///           is not of interest,
     ///           [std::io::Sink](https://doc.rust-lang.org/std/io/struct.Sink.html)
     ///           can be used here.
-    pub fn with_events(trigger: T, serial_evts: EV, out: W) -> Self {
+    pub fn with_events(trigger: T, serial_evts: EV, out: W,  input: Option<Box<dyn ReadableFd + Send>>,kick: Option<EventFd>) -> Self {
         Serial {
             baud_divisor_low: DEFAULT_BAUD_DIVISOR_LOW,
             baud_divisor_high: DEFAULT_BAUD_DIVISOR_HIGH,
@@ -289,6 +302,8 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
             interrupt_evt: trigger,
             events: serial_evts,
             out,
+            input,
+            buffer_ready_evt: kick,
         }
     }
 
@@ -342,7 +357,8 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
         }
     }
 
-    fn thr_empty_interrupt(&mut self) -> Result<(), T::E> {
+    /// doc
+    pub fn thr_empty_interrupt(&mut self) -> Result<(), T::E> {
         if self.is_thr_interrupt_enabled() {
             // Trigger the interrupt only if the identification bit wasn't
             // set or acknowledged.
@@ -450,11 +466,13 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
                 // interrupt identification register and RDA bit when no
                 // more data is available).
                 self.del_interrupt(IIR_RDA_BIT);
+                self.events.buffer_read();
+                
+
                 if self.in_buffer.len() <= 1 {
                     self.clear_lsr_rda_bit();
+                    self.signal_buffer_ready().expect("smth");
                 }
-
-                self.events.buffer_read();
                 self.in_buffer.pop_front().unwrap_or_default()
             }
             IER_OFFSET => self.interrupt_enable,
@@ -496,6 +514,36 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
             SCR_OFFSET => self.scratch,
             _ => 0,
         }
+    }
+
+    #[inline]
+    /// doc
+    pub fn serial_input_fd(&self) -> RawFd {
+        self.input.as_ref().map_or(-1, |input| input.as_raw_fd())
+    }
+
+    #[inline]
+    /// doc
+    pub fn buffer_ready_evt_fd(&self) -> RawFd {
+        self.buffer_ready_evt
+            .as_ref()
+            .map_or(-1, |buf_ready| buf_ready.as_raw_fd())
+    }
+
+    #[inline]
+    /// doc
+    pub fn consume_buffer_ready_evt(&self) -> Result<u64, io::Error> {
+        self.buffer_ready_evt
+            .as_ref()
+            .map_or(Ok(0), |buf_ready| Ok(buf_ready.read()?))
+    }
+    
+    #[inline]
+    /// doc
+    pub fn signal_buffer_ready(&self) -> Result<(), io::Error> {
+        self.buffer_ready_evt
+            .as_ref()
+            .map_or(Ok(()), |buf_ready| Ok(buf_ready.write(1)?))
     }
 
     /// Returns how much space is still available in the FIFO.
@@ -591,7 +639,8 @@ mod tests {
     #[test]
     fn test_serial_output() {
         let intr_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
-        let mut serial = Serial::new(intr_evt, Vec::new());
+        let kick = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let mut serial = Serial::new(intr_evt.try_clone().unwrap(), Vec::new(), Some(kick));
 
         // Valid one char at a time writes.
         RAW_INPUT_BUF
@@ -603,7 +652,8 @@ mod tests {
     #[test]
     fn test_serial_raw_input() {
         let intr_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
-        let mut serial = Serial::new(intr_evt.try_clone().unwrap(), sink());
+        let kick = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let mut serial = Serial::new(intr_evt.try_clone().unwrap(), sink(), Some(kick));
 
         serial.write(IER_OFFSET, IER_RDA_BIT).unwrap();
         serial.enqueue_raw_bytes(&RAW_INPUT_BUF).unwrap();
@@ -637,7 +687,8 @@ mod tests {
     #[test]
     fn test_serial_thr() {
         let intr_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
-        let mut serial = Serial::new(intr_evt.try_clone().unwrap(), sink());
+        let kick = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let mut serial = Serial::new(intr_evt.try_clone().unwrap(), sink(), Some(kick));
 
         serial.write(IER_OFFSET, IER_THR_EMPTY_BIT).unwrap();
         assert_eq!(
@@ -667,7 +718,8 @@ mod tests {
     #[test]
     fn test_serial_loop_mode() {
         let intr_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
-        let mut serial = Serial::new(intr_evt.try_clone().unwrap(), sink());
+        let kick = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let mut serial = Serial::new(intr_evt.try_clone().unwrap(), sink(), Some(kick));
 
         serial.write(MCR_OFFSET, MCR_LOOP_BIT).unwrap();
         serial.write(IER_OFFSET, IER_RDA_BIT).unwrap();
@@ -700,7 +752,8 @@ mod tests {
     #[test]
     fn test_serial_dlab() {
         let intr_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
-        let mut serial = Serial::new(intr_evt, sink());
+        let kick = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let mut serial = Serial::new(intr_evt.try_clone().unwrap(), sink(), Some(kick));
 
         // For writing to DLAB registers, `DLAB` bit from LCR should be set.
         serial.write(LCR_OFFSET, LCR_DLAB_BIT).unwrap();
@@ -723,7 +776,8 @@ mod tests {
     #[test]
     fn test_basic_register_accesses() {
         let intr_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
-        let mut serial = Serial::new(intr_evt, sink());
+        let kick = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let mut serial = Serial::new(intr_evt.try_clone().unwrap(), sink(), Some(kick));
 
         // Writing to these registers does not alter the initial values to be written
         // and reading from these registers just returns those values, without
@@ -738,7 +792,8 @@ mod tests {
     #[test]
     fn test_invalid_access() {
         let intr_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
-        let mut serial = Serial::new(intr_evt, sink());
+        let kick = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let mut serial = Serial::new(intr_evt.try_clone().unwrap(), sink(), Some(kick));
 
         // Check if reading from an offset outside 0-7 returns for sure 0.
         serial.write(SCR_OFFSET + 1, 5).unwrap();
@@ -748,7 +803,8 @@ mod tests {
     #[test]
     fn test_serial_msr() {
         let intr_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
-        let mut serial = Serial::new(intr_evt, sink());
+        let kick = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let mut serial = Serial::new(intr_evt.try_clone().unwrap(), sink(), Some(kick));
 
         assert_eq!(serial.read(MSR_OFFSET), DEFAULT_MODEM_STATUS);
 
@@ -783,8 +839,9 @@ mod tests {
 
     #[test]
     fn test_fifo_max_size() {
-        let event_fd = EventFd::new(libc::EFD_NONBLOCK).unwrap();
-        let mut serial = Serial::new(event_fd, sink());
+        let intr_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let kick = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let mut serial = Serial::new(intr_evt.try_clone().unwrap(), sink(), Some(kick));
 
         // Test case: trying to write too many bytes in an empty fifo will just write
         // `FIFO_SIZE`. Any other subsequent writes, will return a `FullFifo` error.
@@ -814,7 +871,8 @@ mod tests {
         let intr_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
         let metrics = Arc::new(ExampleSerialMetrics::default());
         let mut oneslot_buf = [0u8; 1];
-        let mut serial = Serial::with_events(intr_evt, metrics, oneslot_buf.as_mut());
+        let kick = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let mut serial = Serial::with_events(intr_evt, metrics, oneslot_buf.as_mut(), Some(kick));
 
         // Check everything is equal to 0 at the beginning.
         assert_eq!(serial.events.read_count.count(), 0);
@@ -846,7 +904,12 @@ mod tests {
     fn test_out_descrp_full_thre_sent() {
         let mut nospace_buf = [0u8; 0];
         let intr_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
-        let mut serial = Serial::new(intr_evt, nospace_buf.as_mut());
+        let kick = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let mut serial = Serial::new(
+            intr_evt.try_clone().unwrap(),
+            nospace_buf.as_mut(),
+            Some(kick),
+        );
 
         // Enable THR interrupt.
         serial.write(IER_OFFSET, IER_THR_EMPTY_BIT).unwrap();
