@@ -15,6 +15,7 @@ use std::io::{self, Write};
 use std::result::Result;
 use std::sync::Arc;
 
+use crate::Disarm;
 use crate::Trigger;
 
 // Register offsets.
@@ -144,6 +145,24 @@ impl<EV: SerialEvents> SerialEvents for Arc<EV> {
     }
 }
 
+/// Necesary information
+//pub trait NamingIsHard: Trigger + Disarm {}
+
+/// doesn't compile otherwise
+pub struct NoMonitor;
+
+impl Trigger for NoMonitor {
+    type E = io::Error;
+
+    fn trigger(&self) -> Result<(), Self::E> {Ok(())}
+}
+impl Disarm for NoMonitor {
+    type F = io::Error;
+
+    fn disarm(&self) -> Result<u64, Self::F>{Ok(0)}
+}
+
+
 /// The serial console emulation is done by emulating a serial COM port.
 ///
 /// Each serial COM port (COM1-4) has an associated Port I/O address base and
@@ -204,7 +223,7 @@ impl<EV: SerialEvents> SerialEvents for Arc<EV> {
 ///     serial.enqueue_raw_bytes(input).unwrap();
 /// }
 /// ```
-pub struct Serial<T: Trigger, EV: SerialEvents, W: Write> {
+pub struct Serial<T: Trigger, EV: SerialEvents, W: Write, NH: Trigger + Disarm> {
     // Some UART registers.
     baud_divisor_low: u8,
     baud_divisor_high: u8,
@@ -224,6 +243,8 @@ pub struct Serial<T: Trigger, EV: SerialEvents, W: Write> {
     interrupt_evt: T,
     events: EV,
     out: W,
+    /// smth
+    pub buffer_ready_event: Option<NH>,
 }
 
 /// Errors encountered while handling serial console operations.
@@ -235,9 +256,11 @@ pub enum Error<E> {
     IOError(io::Error),
     /// No space left in FIFO.
     FullFifo,
+    /// Failed to read from fd
+    Disarm(E),
 }
 
-impl<T: Trigger, W: Write> Serial<T, NoEvents, W> {
+impl<T: Trigger, W: Write> Serial<T, NoEvents, W, NoMonitor> {
     /// Creates a new `Serial` instance which writes the guest's output to
     /// `out` and uses `trigger` object to notify the driver about new
     /// events.
@@ -254,12 +277,12 @@ impl<T: Trigger, W: Write> Serial<T, NoEvents, W> {
     ///
     /// You can see an example of how to use this function in the
     /// [`Example` section from `Serial`](struct.Serial.html#example).
-    pub fn new(trigger: T, out: W) -> Serial<T, NoEvents, W> {
-        Self::with_events(trigger, NoEvents, out)
+    pub fn new(trigger: T, out: W) -> Serial<T, NoEvents, W, NoMonitor> {
+        Self::with_events(trigger, NoEvents, out, None)
     }
 }
 
-impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
+impl<T: Trigger, EV: SerialEvents, W: Write, NH: Trigger + Disarm> Serial<T, EV, W, NH> {
     /// Creates a new `Serial` instance which writes the guest's output to
     /// `out`, uses `trigger` object to notify the driver about new
     /// events, and invokes the `serial_evts` implementation of `SerialEvents`
@@ -274,7 +297,12 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
     ///           is not of interest,
     ///           [std::io::Sink](https://doc.rust-lang.org/std/io/struct.Sink.html)
     ///           can be used here.
-    pub fn with_events(trigger: T, serial_evts: EV, out: W) -> Self {
+    pub fn with_events(
+        trigger: T,
+        serial_evts: EV,
+        out: W,
+        buffer_ready_event: Option<NH>,
+    ) -> Self {
         Serial {
             baud_divisor_low: DEFAULT_BAUD_DIVISOR_LOW,
             baud_divisor_high: DEFAULT_BAUD_DIVISOR_HIGH,
@@ -289,6 +317,7 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
             interrupt_evt: trigger,
             events: serial_evts,
             out,
+            buffer_ready_event,
         }
     }
 
@@ -322,6 +351,20 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
         self.interrupt_evt.trigger()
     }
 
+    /// smth
+    pub fn trigger_buffer_ready_event(&self) -> Result<(), NH::E> {
+        self.buffer_ready_event
+            .as_ref()
+            .map_or(Ok(()), |buffer_ready| buffer_ready.trigger())
+    }
+
+    /// smth 
+    pub fn disarm_buffer_ready_event(&self) -> Result<u64, NH::F> {
+        self.buffer_ready_event
+            .as_ref()
+            .map_or(Ok(0), |buf_ready| buf_ready.disarm())
+    }
+
     fn set_lsr_rda_bit(&mut self) {
         self.line_status |= LSR_DATA_READY_BIT
     }
@@ -342,7 +385,8 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
         }
     }
 
-    fn thr_empty_interrupt(&mut self) -> Result<(), T::E> {
+    /// smth
+    pub fn thr_empty_interrupt(&mut self) -> Result<(), T::E> {
         if self.is_thr_interrupt_enabled() {
             // Trigger the interrupt only if the identification bit wasn't
             // set or acknowledged.
@@ -450,12 +494,15 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
                 // interrupt identification register and RDA bit when no
                 // more data is available).
                 self.del_interrupt(IIR_RDA_BIT);
-                if self.in_buffer.len() <= 1 {
-                    self.clear_lsr_rda_bit();
-                }
-
                 self.events.buffer_read();
-                self.in_buffer.pop_front().unwrap_or_default()
+                let byte = self.in_buffer.pop_front().unwrap_or_default();
+                if self.in_buffer.is_empty() {
+                    self.clear_lsr_rda_bit();
+                    if self.trigger_buffer_ready_event().is_err() {
+                        
+                    }
+                }
+                byte
             }
             IER_OFFSET => self.interrupt_enable,
             IIR_OFFSET => {
@@ -563,6 +610,14 @@ mod tests {
 
         fn trigger(&self) -> Result<()> {
             self.write(1)
+        }
+    }
+
+    impl Disarm for EventFd {
+        type F = io::Error;
+
+        fn disarm(&self) -> Result<u64> {
+            self.read()
         }
     }
 
@@ -813,8 +868,9 @@ mod tests {
     fn test_serial_events() {
         let intr_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
         let metrics = Arc::new(ExampleSerialMetrics::default());
+        let buffer_ready_event = EventFd::new(libc::EFD_NONBLOCK).unwrap();
         let mut oneslot_buf = [0u8; 1];
-        let mut serial = Serial::with_events(intr_evt, metrics, oneslot_buf.as_mut());
+        let mut serial = Serial::with_events(intr_evt, metrics, oneslot_buf.as_mut(), Some(buffer_ready_event));
 
         // Check everything is equal to 0 at the beginning.
         assert_eq!(serial.events.read_count.count(), 0);

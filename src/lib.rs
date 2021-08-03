@@ -51,3 +51,12 @@ pub trait Trigger {
     /// Trigger an event.
     fn trigger(&self) -> Result<(), Self::E>;
 }
+
+/// Necessary information
+pub trait Disarm {
+    /// here
+    type F;
+
+    /// and especially here
+    fn disarm(&self) -> Result<u64, Self::F>;
+}
