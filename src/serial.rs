@@ -450,12 +450,12 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
                 // interrupt identification register and RDA bit when no
                 // more data is available).
                 self.del_interrupt(IIR_RDA_BIT);
-                if self.in_buffer.len() <= 1 {
+                let byte = self.in_buffer.pop_front().unwrap_or_default();
+                if self.in_buffer.is_empty() {
                     self.clear_lsr_rda_bit();
                 }
-
-                self.events.buffer_read();
-                self.in_buffer.pop_front().unwrap_or_default()
+                byte
+                
             }
             IER_OFFSET => self.interrupt_enable,
             IIR_OFFSET => {
