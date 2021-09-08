@@ -117,6 +117,8 @@ pub trait SerialEvents {
     fn out_byte(&self);
     /// An error occurred while writing a byte to serial output resulting in a lost byte.
     fn tx_lost_byte(&self);
+    /// descriere
+    fn in_buffer_empty(&self);
 }
 
 /// Provides a no-op implementation of `SerialEvents` which can be used in situations that
@@ -128,6 +130,7 @@ impl SerialEvents for NoEvents {
     fn buffer_read(&self) {}
     fn out_byte(&self) {}
     fn tx_lost_byte(&self) {}
+    fn in_buffer_empty(&self) {}
 }
 
 impl<EV: SerialEvents> SerialEvents for Arc<EV> {
@@ -141,6 +144,10 @@ impl<EV: SerialEvents> SerialEvents for Arc<EV> {
 
     fn tx_lost_byte(&self) {
         self.as_ref().tx_lost_byte();
+    }
+
+    fn in_buffer_empty(&self) {
+        self.as_ref().in_buffer_empty();
     }
 }
 
@@ -450,12 +457,16 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
                 // interrupt identification register and RDA bit when no
                 // more data is available).
                 self.del_interrupt(IIR_RDA_BIT);
-                if self.in_buffer.len() <= 1 {
+                let byte = self.in_buffer.pop_front(); //.unwrap_or_default();
+                if byte.is_none() {
                     self.clear_lsr_rda_bit();
+                    return 0;
                 }
-
+                if self.in_buffer.is_empty() {
+                    self.events().in_buffer_empty()
+                }
                 self.events.buffer_read();
-                self.in_buffer.pop_front().unwrap_or_default()
+                byte.unwrap()
             }
             IER_OFFSET => self.interrupt_enable,
             IIR_OFFSET => {
@@ -566,11 +577,11 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct ExampleSerialMetrics {
         read_count: AtomicU64,
         out_byte_count: AtomicU64,
         tx_lost_byte_count: AtomicU64,
+        buffer_ready_event: Option<EventFd>,
     }
 
     impl SerialEvents for ExampleSerialMetrics {
@@ -585,6 +596,31 @@ mod tests {
 
         fn tx_lost_byte(&self) {
             self.tx_lost_byte_count.inc();
+        }
+
+        fn in_buffer_empty(&self) {
+            match self
+                .buffer_ready_event
+                .as_ref()
+                .map_or(Ok(()), |buf_ready| buf_ready.write(1))
+            {
+                Ok(_) => (),
+                Err(err) => println!(
+                    "Could not signal that serial device buffer is ready: {:?}",
+                    err
+                ),
+            }
+        }
+    }
+
+    impl Default for ExampleSerialMetrics {
+        fn default() -> Self {
+            ExampleSerialMetrics {
+                read_count: AtomicU64::new(0),
+                out_byte_count: AtomicU64::new(0),
+                tx_lost_byte_count: AtomicU64::new(0),
+                buffer_ready_event: Some(EventFd::new(libc::EFD_NONBLOCK).unwrap()),
+            }
         }
     }
 
@@ -840,6 +876,23 @@ mod tests {
         assert_eq!(serial.events.read_count.count(), 1);
         assert_eq!(serial.events.out_byte_count.count(), 1);
         assert_eq!(serial.events.tx_lost_byte_count.count(), 1);
+
+        // This DATA write should cause `SerialEvents::out_byte` to be called.
+        //serial.write(DATA_OFFSET, 1).unwrap();
+        //assert_eq!(serial.events.out_byte_count.count(), 1);
+        // This DATA read should cause the `SerialEvents::buffer_read` method to be invoked.
+        serial.read(DATA_OFFSET);
+        assert_eq!(serial.events.read_count.count(), 2);
+        assert_eq!(
+            serial
+                .events
+                .buffer_ready_event
+                .as_ref()
+                .unwrap()
+                .read()
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
